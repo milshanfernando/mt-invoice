@@ -30,6 +30,30 @@ import html2canvas from "html2canvas-pro";
  *   The invoice is now also rendered once, at full size, completely
  *   off-screen (no transform, no clipping) and THAT node is what gets
  *   captured. The on-screen scaled copy is purely visual.
+ *
+ * MOBILE FIX NOTES (this revision):
+ * - iOS Safari (and several Android browsers) automatically zoom the page
+ *   in when you focus an <input>/<select>/<textarea> whose computed
+ *   font-size is under 16px. This form used `text-sm` (14px) inputs, which
+ *   triggered that auto-zoom, and the page never zoomed back out cleanly —
+ *   hence the "becomes larger than the screen" symptom. Every field now
+ *   renders at 16px minimum (`text-base`), which stops the browser from
+ *   zooming in the first place.
+ * - Numeric fields now set `inputMode` so mobile keyboards show the number
+ *   pad instead of the full QWERTY keyboard.
+ * - Buttons/tabs use `touch-manipulation` to remove the ~300ms tap delay
+ *   and prevent double-tap-to-zoom on controls.
+ * - Touch targets are at least 44px tall (Apple/Google's recommended
+ *   minimum), and the sticky bottom action bar now respects the iPhone
+ *   home-indicator safe area so it isn't obscured on notdurch devices.
+ * - Root container has `overflow-x-hidden` as a safety net against any
+ *   accidental horizontal scroll/layout shift on small screens.
+ *
+ * ONE MORE THING TO CHECK (outside this file): open your project's
+ * index.html and confirm the viewport meta tag reads:
+ *   <meta name="viewport" content="width=device-width, initial-scale=1" />
+ * With the 16px input fix above you do NOT need user-scalable=no —
+ * disabling pinch-zoom hurts accessibility and is no longer necessary.
  */
 
 const TITLES = ["Mr.", "Mrs.", "Ms.", "Miss", "Dr.", "Eng.", "(none)"];
@@ -227,8 +251,13 @@ function Field({
 
 // Colors are explicit (bg-white text-gray-900) so this can never inherit an
 // invisible-text bug from global/dark-mode CSS elsewhere in the project.
+//
+// MOBILE FIX: font-size must be >= 16px (`text-base`) or iOS Safari will
+// auto-zoom the whole page on focus. min-h-[44px] gives a comfortable tap
+// target, and touch-manipulation removes the tap delay / disables the
+// double-tap-to-zoom gesture on the field itself.
 const inputCls =
-  "w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500";
+  "w-full rounded-lg border border-gray-300 px-3 py-2.5 text-base bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 min-h-[44px] touch-manipulation";
 
 export default function App() {
   const [data, setData] = useState<InvoiceData>(buildDefaultData);
@@ -674,7 +703,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-100 pb-24">
+    <div className="min-h-screen bg-gray-100 pb-24 overflow-x-hidden">
       {/* Top tab bar */}
       <div className="sticky top-0 z-20 bg-white border-b border-gray-200 px-3 pt-3 pb-0">
         <h1 className="text-base font-bold text-gray-800 mb-2 px-1">
@@ -683,7 +712,7 @@ export default function App() {
         <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
           <button
             onClick={() => setTab("edit")}
-            className={`flex-1 py-2 text-sm font-semibold rounded-md transition ${
+            className={`flex-1 py-2.5 text-sm font-semibold rounded-md transition touch-manipulation min-h-[44px] ${
               tab === "edit" ? "bg-white shadow text-gray-900" : "text-gray-500"
             }`}
           >
@@ -691,7 +720,7 @@ export default function App() {
           </button>
           <button
             onClick={() => setTab("preview")}
-            className={`flex-1 py-2 text-sm font-semibold rounded-md transition ${
+            className={`flex-1 py-2.5 text-sm font-semibold rounded-md transition touch-manipulation min-h-[44px] ${
               tab === "preview"
                 ? "bg-white shadow text-gray-900"
                 : "text-gray-500"
@@ -720,7 +749,7 @@ export default function App() {
             </Field>
 
             <details className="mb-4">
-              <summary className="cursor-pointer text-sm font-semibold text-amber-700 mb-2">
+              <summary className="cursor-pointer text-sm font-semibold text-amber-700 mb-2 py-2 touch-manipulation">
                 Business info (edit details)
               </summary>
               <div className="mt-3">
@@ -754,6 +783,8 @@ export default function App() {
                 </Field>
                 <Field label="Phone">
                   <input
+                    type="tel"
+                    inputMode="tel"
                     className={inputCls}
                     value={data.phone}
                     onChange={(e) => update("phone", e.target.value)}
@@ -761,6 +792,8 @@ export default function App() {
                 </Field>
                 <Field label="Email">
                   <input
+                    type="email"
+                    inputMode="email"
                     className={inputCls}
                     value={data.email}
                     onChange={(e) => update("email", e.target.value)}
@@ -788,7 +821,7 @@ export default function App() {
                       </div>
                     )}
                     <div className="flex flex-col gap-1">
-                      <label className="text-xs font-semibold text-amber-700 cursor-pointer">
+                      <label className="text-xs font-semibold text-amber-700 cursor-pointer touch-manipulation py-1">
                         {sealImage ? "Change image" : "Upload PNG"}
                         <input
                           type="file"
@@ -800,7 +833,7 @@ export default function App() {
                       {sealImage && (
                         <button
                           type="button"
-                          className="text-xs text-red-500 text-left"
+                          className="text-xs text-red-500 text-left touch-manipulation py-1"
                           onClick={() => setSealImage(null)}
                         >
                           Remove
@@ -824,7 +857,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={handleNewInvoiceNumber}
-                  className="shrink-0 rounded-lg border border-amber-600 text-amber-700 text-xs font-semibold px-3"
+                  className="shrink-0 rounded-lg border border-amber-600 text-amber-700 text-xs font-semibold px-3 min-h-[44px] touch-manipulation"
                   title="Generate next invoice number"
                 >
                   New #
@@ -893,6 +926,9 @@ export default function App() {
             <div className="grid grid-cols-2 gap-3">
               <Field label="Total Guests">
                 <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
                   className={inputCls}
                   value={data.totalGuests}
                   onChange={(e) => update("totalGuests", e.target.value)}
@@ -900,6 +936,9 @@ export default function App() {
               </Field>
               <Field label="Total Units">
                 <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
                   className={inputCls}
                   value={data.totalUnits}
                   onChange={(e) => update("totalUnits", e.target.value)}
@@ -915,6 +954,8 @@ export default function App() {
             </Field>
             <Field label="Contact">
               <input
+                type="tel"
+                inputMode="tel"
                 className={inputCls}
                 value={data.contact}
                 onChange={(e) => update("contact", e.target.value)}
@@ -978,6 +1019,9 @@ export default function App() {
             <div className="grid grid-cols-2 gap-3">
               <Field label="Nights (if no dates above)">
                 <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
                   className={inputCls}
                   value={data.qtyNights}
                   onChange={(e) => update("qtyNights", e.target.value)}
@@ -985,6 +1029,8 @@ export default function App() {
               </Field>
               <Field label={`Rate / night (${data.currency})`}>
                 <input
+                  type="text"
+                  inputMode="decimal"
                   className={inputCls}
                   value={data.rate}
                   onChange={(e) => update("rate", e.target.value)}
@@ -1003,6 +1049,8 @@ export default function App() {
               </Field>
               <Field label={`Discount amount (${data.currency})`}>
                 <input
+                  type="text"
+                  inputMode="decimal"
                   className={inputCls}
                   value={data.discountAmount}
                   onChange={(e) => update("discountAmount", e.target.value)}
@@ -1048,7 +1096,7 @@ export default function App() {
 
             <button
               onClick={() => setTab("preview")}
-              className="w-full mt-2 rounded-lg bg-amber-600 text-white text-sm font-semibold py-2.5 hover:bg-amber-700"
+              className="w-full mt-2 rounded-lg bg-amber-600 text-white text-sm font-semibold py-3 hover:bg-amber-700 min-h-[44px] touch-manipulation"
             >
               Preview Invoice →
             </button>
@@ -1084,7 +1132,7 @@ export default function App() {
 
             <button
               onClick={() => setTab("edit")}
-              className="w-full mt-3 rounded-lg border border-gray-300 text-gray-700 text-sm font-semibold py-2.5"
+              className="w-full mt-3 rounded-lg border border-gray-300 text-gray-700 text-sm font-semibold py-3 min-h-[44px] touch-manipulation"
             >
               ← Back to Edit
             </button>
@@ -1117,20 +1165,24 @@ export default function App() {
         </div>
       </div>
 
-      {/* Sticky bottom action bar */}
-      <div className="fixed bottom-0 inset-x-0 bg-white border-t border-gray-200 p-3 z-20">
+      {/* Sticky bottom action bar — padding-bottom includes the iPhone
+          home-indicator safe area so the buttons never sit under it. */}
+      <div
+        className="fixed bottom-0 inset-x-0 bg-white border-t border-gray-200 p-3 z-20"
+        style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
+      >
         <div className="max-w-xl mx-auto flex gap-2">
           <button
             onClick={handleDownload}
             disabled={busy !== null}
-            className="flex-1 rounded-lg bg-gray-900 text-white text-sm font-semibold py-3 disabled:opacity-50"
+            className="flex-1 rounded-lg bg-gray-900 text-white text-sm font-semibold py-3 disabled:opacity-50 min-h-[44px] touch-manipulation"
           >
             {busy === "pdf" ? "Generating…" : "Download PDF"}
           </button>
           <button
             onClick={handleShareWhatsApp}
             disabled={busy !== null}
-            className="flex-1 rounded-lg bg-green-600 text-white text-sm font-semibold py-3 disabled:opacity-50"
+            className="flex-1 rounded-lg bg-green-600 text-white text-sm font-semibold py-3 disabled:opacity-50 min-h-[44px] touch-manipulation"
           >
             {busy === "share" ? "Preparing…" : "Share WhatsApp"}
           </button>
