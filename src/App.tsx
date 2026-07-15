@@ -1,21 +1,96 @@
 import { useEffect, useRef, useState } from "react";
 import jsPDF from "jspdf";
-import html2canvas from "html2canvas";
+import html2canvas from "html2canvas-pro";
 
 /**
  * SIMPLE INVOICE SYSTEM — MOBILE FIRST
  * -------------------------------------
- * npm install jspdf html2canvas
+ * npm install jspdf html2canvas-pro
+ *
+ * IMPORTANT: uses `html2canvas-pro`, NOT the original `html2canvas`.
+ * If your Tailwind version is v4+, its default color palette compiles to
+ * oklch()/lab() color values, which the classic html2canvas cannot parse —
+ * it throws immediately and every export silently fails into the catch
+ * block. html2canvas-pro is a maintained fork that supports these modern
+ * color functions and is a drop-in replacement (same API).
  *
  * - Edit / Preview tabs (built for small screens, works fine on desktop too)
+ * - Business selector (auto-fills business details per property)
  * - Guest title dropdown (Mr. / Mrs. / Ms. / Miss / Dr. / Eng.)
+ * - Room type dropdown (with "Custom" fallback)
+ * - Payment method + payment status dropdowns
+ * - Invoice number auto-increments per business (persisted in localStorage)
  * - Company seal: upload a PNG/JPG and it's stamped onto the invoice
  * - Download PDF or Share directly to WhatsApp (native share sheet on phones)
+ *
+ * FIX NOTES (this revision):
+ * - PDF/WhatsApp export previously captured the on-screen node, which has a
+ *   CSS `transform: scale()` applied for responsive display. html2canvas does
+ *   not reliably render transformed nodes, which produced blank/broken PDFs.
+ *   The invoice is now also rendered once, at full size, completely
+ *   off-screen (no transform, no clipping) and THAT node is what gets
+ *   captured. The on-screen scaled copy is purely visual.
  */
 
 const TITLES = ["Mr.", "Mrs.", "Ms.", "Miss", "Dr.", "Eng.", "(none)"];
 
+const ROOM_TYPES = [
+  "Standard Single Room with Shared Bathroom",
+  "King Room with Shared Bathroom",
+  "Queen Room with Shared Bathroom",
+];
+
+const PAYMENT_METHODS = ["Cash", "Card", "Bank Transfer"];
+const PAYMENT_STATUSES = ["Paid", "Pending", "Advance Payment"];
+
+interface BusinessProfile {
+  businessName: string;
+  businessTagline: string;
+  address1: string;
+  address2: string;
+  phone: string;
+  email: string;
+  website: string;
+  code: string; // used as invoice number prefix
+}
+
+const BUSINESS_PROFILES: Record<string, BusinessProfile> = {
+  "Majestic Town": {
+    businessName: "MAJESTIC TOWN",
+    businessTagline: "GUEST HOUSE",
+    address1: "Al Khalidiya, Behind Shining Tower,",
+    address2: "Building No. 15, Floor M, Office M2",
+    phone: "+971 54 757 5749",
+    email: "info@majestictown.ae",
+    website: "www.majestictown.ae",
+    code: "MT",
+  },
+  "Vouge Inn": {
+    businessName: "VOUGE INN",
+    businessTagline: "GUEST HOUSE",
+    address1: "Enter address line 1",
+    address2: "Enter address line 2",
+    phone: "+971 5X XXX XXXX",
+    email: "info@vogueinn.ae",
+    website: "www.vogueinn.ae",
+    code: "VI",
+  },
+  "DSV Property": {
+    businessName: "DSV PROPERTY",
+    businessTagline: "GUEST HOUSE",
+    address1: "Enter address line 1",
+    address2: "Enter address line 2",
+    phone: "+971 5X XXX XXXX",
+    email: "info@dsvproperty.ae",
+    website: "www.dsvproperty.ae",
+    code: "DSV",
+  },
+};
+
+const BUSINESS_KEYS = Object.keys(BUSINESS_PROFILES);
+
 interface InvoiceData {
+  businessKey: string;
   businessName: string;
   businessTagline: string;
   address1: string;
@@ -53,43 +128,67 @@ interface InvoiceData {
   currency: string;
 }
 
-const defaultData: InvoiceData = {
-  businessName: "MAJESTIC TOWN",
-  businessTagline: "GUEST HOUSE",
-  address1: "Al Khalidiya, Behind Shining Tower,",
-  address2: "Building No. 15, Floor M, Office M2",
-  phone: "+971 54 757 5749",
-  email: "info@majestictown.ae",
-  website: "www.majestictown.ae",
+// ---------- Invoice number auto-increment (persisted per business) ----------
+let memoryCounterFallback: Record<string, number> = {};
 
-  invoiceNo: "MT-2026-07-15-001",
-  invoiceDate: new Date().toISOString().slice(0, 10),
-  bookingSource: "Direct Booking",
-  invoiceStatus: "PAID",
+function getNextInvoiceNumber(code: string): string {
+  const storageKey = `invoiceCounter_${code}`;
+  let next = 1;
+  try {
+    const current = parseInt(localStorage.getItem(storageKey) || "0", 10);
+    next = (isNaN(current) ? 0 : current) + 1;
+    localStorage.setItem(storageKey, String(next));
+  } catch {
+    // localStorage unavailable (e.g. private mode) — fall back to in-memory counter
+    memoryCounterFallback[code] = (memoryCounterFallback[code] || 0) + 1;
+    next = memoryCounterFallback[code];
+  }
+  const yyyy = new Date().getFullYear();
+  return `${code}-${yyyy}-${String(next).padStart(4, "0")}`;
+}
 
-  guestTitle: "Mr.",
-  guestName: "",
-  totalGuests: "1",
-  idPassport: "",
-  contact: "",
+function buildDefaultData(): InvoiceData {
+  const initialKey = BUSINESS_KEYS[0];
+  const profile = BUSINESS_PROFILES[initialKey];
+  return {
+    businessKey: initialKey,
+    businessName: profile.businessName,
+    businessTagline: profile.businessTagline,
+    address1: profile.address1,
+    address2: profile.address2,
+    phone: profile.phone,
+    email: profile.email,
+    website: profile.website,
 
-  checkIn: "",
-  checkOut: "",
-  totalUnits: "1",
+    invoiceNo: "",
+    invoiceDate: new Date().toISOString().slice(0, 10),
+    bookingSource: "Direct Booking",
+    invoiceStatus: "PAID",
 
-  roomDescription: "Standard Single Room",
-  qtyNights: "1",
-  rate: "85",
+    guestTitle: "Mr.",
+    guestName: "",
+    totalGuests: "1",
+    idPassport: "",
+    contact: "",
 
-  discountLabel: "",
-  discountAmount: "0",
+    checkIn: "",
+    checkOut: "",
+    totalUnits: "1",
 
-  paymentMethod: "Cash",
-  paymentStatus: "PAID",
-  transactionId: "",
+    roomDescription: ROOM_TYPES[0],
+    qtyNights: "1",
+    rate: "85",
 
-  currency: "AED",
-};
+    discountLabel: "",
+    discountAmount: "0",
+
+    paymentMethod: "Cash",
+    paymentStatus: "Paid",
+    transactionId: "",
+
+    currency: "AED",
+  };
+}
 
 function fmt(n: number) {
   return n.toLocaleString(undefined, {
@@ -132,13 +231,16 @@ const inputCls =
   "w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500";
 
 export default function App() {
-  const [data, setData] = useState<InvoiceData>(defaultData);
-  const [sealImage, setSealImage] = useState<string | null>(null);
+  const [data, setData] = useState<InvoiceData>(buildDefaultData);
+  const [sealImage, setSealImage] = useState<string | null>("/seal.png");
   const [tab, setTab] = useState<"edit" | "preview">("edit");
   const [busy, setBusy] = useState<"pdf" | "share" | null>(null);
 
-  const previewRef = useRef<HTMLDivElement>(null); // fixed-width 700px node used for PDF capture
-  const scaleWrapRef = useRef<HTMLDivElement>(null); // responsive container we measure
+  // Full-size, unscaled, off-screen node — this is what actually gets captured for PDF/share.
+  const captureRef = useRef<HTMLDivElement>(null);
+
+  // On-screen scaled copy — purely visual, never used for export.
+  const scaleWrapRef = useRef<HTMLDivElement>(null);
 
   const [scale, setScale] = useState(1);
   const [contentHeight, setContentHeight] = useState(0);
@@ -146,21 +248,54 @@ export default function App() {
   const update = (key: keyof InvoiceData, value: string) =>
     setData((d) => ({ ...d, [key]: value }));
 
-  // Responsive scaling: fit the fixed 700px invoice into whatever width is available
+  // Assign the first auto invoice number once on mount.
+  useEffect(() => {
+    const code = BUSINESS_PROFILES[buildDefaultData().businessKey].code;
+    setData((d) => ({
+      ...d,
+      invoiceNo: d.invoiceNo || getNextInvoiceNumber(code),
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function handleBusinessChange(key: string) {
+    const profile = BUSINESS_PROFILES[key];
+    if (!profile) return;
+    setData((d) => ({
+      ...d,
+      businessKey: key,
+      businessName: profile.businessName,
+      businessTagline: profile.businessTagline,
+      address1: profile.address1,
+      address2: profile.address2,
+      phone: profile.phone,
+      email: profile.email,
+      website: profile.website,
+      invoiceNo: getNextInvoiceNumber(profile.code),
+    }));
+  }
+
+  function handleNewInvoiceNumber() {
+    const code = BUSINESS_PROFILES[data.businessKey]?.code || "INV";
+    update("invoiceNo", getNextInvoiceNumber(code));
+  }
+
+  // Measure the always-present, full-size capture node so the scaled
+  // preview wrapper knows how tall to be.
   useEffect(() => {
     function recalc() {
       if (scaleWrapRef.current) {
         const w = scaleWrapRef.current.offsetWidth;
         setScale(Math.min(1, w / 700));
       }
-      if (previewRef.current) {
-        setContentHeight(previewRef.current.offsetHeight);
+      if (captureRef.current) {
+        setContentHeight(captureRef.current.offsetHeight);
       }
     }
     recalc();
     window.addEventListener("resize", recalc);
     const ro = new ResizeObserver(recalc);
-    if (previewRef.current) ro.observe(previewRef.current);
+    if (captureRef.current) ro.observe(captureRef.current);
     return () => {
       window.removeEventListener("resize", recalc);
       ro.disconnect();
@@ -184,6 +319,7 @@ export default function App() {
   const discount = parseFloat(data.discountAmount) || 0;
   const subtotal = nights * rate;
   const total = Math.max(subtotal - discount, 0);
+  const isCustomRoom = !ROOM_TYPES.includes(data.roomDescription);
 
   function handleSealUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -194,13 +330,21 @@ export default function App() {
   }
 
   async function buildPdfBlob(): Promise<Blob> {
-    const node = previewRef.current;
-    if (!node) throw new Error("Preview not ready");
+    const node = captureRef.current;
+    if (!node) throw new Error("Invoice content not ready");
+
     const canvas = await html2canvas(node, {
       scale: 2,
       useCORS: true,
       backgroundColor: "#ffffff",
+      logging: false,
+      windowWidth: 700,
     });
+
+    if (canvas.width === 0 || canvas.height === 0) {
+      throw new Error("Captured canvas was empty");
+    }
+
     const imgData = canvas.toDataURL("image/png");
 
     const pdf = new jsPDF({ unit: "px", format: "a4" });
@@ -235,8 +379,9 @@ export default function App() {
       const blob = await buildPdfBlob();
       downloadBlob(blob, `Invoice-${data.invoiceNo || "draft"}.pdf`);
     } catch (e) {
-      console.error(e);
-      alert("Could not generate the PDF. Please try again.");
+      console.error("PDF generation failed:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      alert(`Could not generate the PDF.\n\nDetails: ${msg}`);
     } finally {
       setBusy(null);
     }
@@ -268,11 +413,264 @@ export default function App() {
         window.open(`https://wa.me/?text=${text}`, "_blank");
       }
     } catch (e) {
-      console.error(e);
-      alert("Could not share the PDF. It may have been downloaded instead.");
+      console.error("WhatsApp share failed:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      alert(`Could not share the PDF.\n\nDetails: ${msg}`);
     } finally {
       setBusy(null);
     }
+  }
+
+  // ---------- Shared invoice markup (used for BOTH the on-screen scaled
+  // preview and the off-screen full-size capture node) ----------
+  function InvoiceBody() {
+    return (
+      <>
+        {/* Header */}
+        <div className="flex justify-between items-start">
+          <div>
+            <div className="text-2xl font-bold tracking-wide text-gray-900">
+              {data.businessName}
+            </div>
+            <div className="text-[11px] tracking-[0.25em] text-amber-700 mt-1 border-t border-amber-600 pt-1 inline-block">
+              {data.businessTagline}
+            </div>
+            <div className="text-xs text-gray-600 mt-4 leading-relaxed">
+              <div>{data.address1}</div>
+              <div className="pl-0">{data.address2}</div>
+              <div className="mt-1">{data.phone}</div>
+            </div>
+          </div>
+          <div className="text-right">
+            <div className="text-4xl font-bold tracking-widest text-gray-900">
+              INVOICE
+            </div>
+            <div className="w-16 h-[2px] bg-amber-600 ml-auto my-2" />
+            <table className="text-xs mt-2">
+              <tbody>
+                <tr>
+                  <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
+                    INVOICE NO.
+                  </td>
+                  <td className="py-0.5 text-gray-800">{data.invoiceNo}</td>
+                </tr>
+                <tr>
+                  <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
+                    INVOICE DATE
+                  </td>
+                  <td className="py-0.5 text-gray-800">
+                    {formatDate(data.invoiceDate)}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
+                    BOOKING SOURCE
+                  </td>
+                  <td className="py-0.5 text-gray-800">{data.bookingSource}</td>
+                </tr>
+                <tr>
+                  <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
+                    INVOICE STATUS
+                  </td>
+                  <td className="py-0.5 font-bold text-green-600">
+                    {data.invoiceStatus}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <hr className="my-5 border-gray-200" />
+
+        {/* Guest / Stay details */}
+        <div className="grid grid-cols-2 gap-8">
+          <div>
+            <div className="font-bold text-sm text-gray-900 mb-2">
+              GUEST DETAILS
+            </div>
+            <table className="text-xs w-full">
+              <tbody>
+                <tr>
+                  <td className="text-gray-500 py-1 w-1/2">Guest Name</td>
+                  <td className="py-1 text-gray-800">
+                    {data.guestTitle ? `${data.guestTitle} ` : ""}
+                    {data.guestName || "—"}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">Total Guests</td>
+                  <td className="py-1 text-gray-800">
+                    {data.totalGuests || "—"}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">ID / Passport No.</td>
+                  <td className="py-1 text-gray-800">
+                    {data.idPassport || "—"}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">Contact</td>
+                  <td className="py-1 text-gray-800">{data.contact || "—"}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <div className="font-bold text-sm text-gray-900 mb-2">
+              STAY DETAILS
+            </div>
+            <table className="text-xs w-full">
+              <tbody>
+                <tr>
+                  <td className="text-gray-500 py-1 w-1/2">Check-in Date</td>
+                  <td className="py-1 text-gray-800">
+                    {formatDate(data.checkIn)}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">Check-out Date</td>
+                  <td className="py-1 text-gray-800">
+                    {formatDate(data.checkOut)}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">Length of Stay</td>
+                  <td className="py-1 text-gray-800">
+                    {nights} Night{nights === 1 ? "" : "s"}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">Total Units</td>
+                  <td className="py-1 text-gray-800">
+                    {data.totalUnits || "—"}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Line items */}
+        <div className="mt-6">
+          <div className="bg-gray-100 grid grid-cols-[2fr_1fr_1fr_1fr] text-xs font-bold text-gray-700 px-3 py-2 rounded-t">
+            <div>DESCRIPTION</div>
+            <div className="text-center">QTY</div>
+            <div className="text-center">RATE ({data.currency})</div>
+            <div className="text-right">AMOUNT ({data.currency})</div>
+          </div>
+          <div className="grid grid-cols-[2fr_1fr_1fr_1fr] text-xs px-3 py-3 border-b border-gray-100">
+            <div>
+              <div className="font-semibold text-gray-800">
+                {data.roomDescription}
+              </div>
+              <div className="text-gray-500 text-[11px]">
+                {data.checkIn && data.checkOut
+                  ? `${formatDate(data.checkIn)} – ${formatDate(data.checkOut)}`
+                  : ""}
+              </div>
+            </div>
+            <div className="text-center text-gray-800">
+              {nights} Night{nights === 1 ? "" : "s"}
+            </div>
+            <div className="text-center text-gray-800">{fmt(rate)}</div>
+            <div className="text-right text-gray-800">{fmt(subtotal)}</div>
+          </div>
+          {discount > 0 && (
+            <div className="grid grid-cols-[2fr_1fr_1fr_1fr] text-xs px-3 py-2 border-b border-gray-100 text-gray-600">
+              <div>{data.discountLabel || "Discount"}</div>
+              <div className="text-center">—</div>
+              <div className="text-center">—</div>
+              <div className="text-right">-{fmt(discount)}</div>
+            </div>
+          )}
+        </div>
+
+        {/* Total */}
+        <div className="flex justify-between items-center mt-4">
+          <div className="font-bold text-sm text-gray-900">
+            TOTAL ({nights} NIGHT{nights === 1 ? "" : "S"})
+          </div>
+          <div className="font-bold text-xl text-gray-900">
+            {data.currency} {fmt(total)}
+          </div>
+        </div>
+
+        {/* Payment info + seal */}
+        <div className="grid grid-cols-2 gap-8 mt-6 items-start relative">
+          <div>
+            <div className="font-bold text-sm text-gray-900 mb-2">
+              PAYMENT INFORMATION
+            </div>
+            <table className="text-xs w-full">
+              <tbody>
+                <tr>
+                  <td className="text-gray-500 py-1 w-1/2">Payment Method</td>
+                  <td className="py-1 text-gray-800">
+                    {data.paymentMethod || "—"}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">Payment Status</td>
+                  <td className="py-1 font-bold text-green-600">
+                    {data.paymentStatus || "—"}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="text-gray-500 py-1">Transaction ID</td>
+                  <td className="py-1 text-gray-800">
+                    {data.transactionId || "—"}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div className="border border-gray-200 rounded-xl p-4 relative overflow-visible">
+            <div className="text-xs font-bold text-gray-700">TOTAL PAYABLE</div>
+            <div className="text-2xl font-bold text-gray-900 mt-1">
+              {data.currency} {fmt(total)}
+            </div>
+            {sealImage && (
+              <img
+                src={sealImage}
+                alt="Company seal"
+                style={{
+                  position: "absolute",
+                  width: 110,
+                  height: 110,
+                  objectFit: "contain",
+                  right: -20,
+                  bottom: -30,
+                  transform: "rotate(-10deg)",
+                  opacity: 0.9,
+                  mixBlendMode: "multiply",
+                  pointerEvents: "none",
+                }}
+              />
+            )}
+          </div>
+        </div>
+
+        <hr className="my-6 border-gray-200" />
+
+        <div className="text-center text-xs text-gray-600">
+          <div className="font-bold text-gray-900 mb-1">
+            Thank you for choosing {data.businessName}.
+          </div>
+          <div>We appreciate your visit. Welcome back anytime!</div>
+        </div>
+
+        <hr className="my-4 border-gray-200" />
+
+        <div className="flex justify-center gap-6 text-[11px] text-gray-600">
+          <span>{data.website}</span>
+          <span>{data.email}</span>
+          <span>{data.phone}</span>
+        </div>
+      </>
+    );
   }
 
   return (
@@ -307,9 +705,23 @@ export default function App() {
       <div className="max-w-xl mx-auto px-3 pt-4">
         {tab === "edit" && (
           <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-4">
+            <Field label="Business">
+              <select
+                className={inputCls}
+                value={data.businessKey}
+                onChange={(e) => handleBusinessChange(e.target.value)}
+              >
+                {BUSINESS_KEYS.map((k) => (
+                  <option key={k} value={k}>
+                    {k}
+                  </option>
+                ))}
+              </select>
+            </Field>
+
             <details className="mb-4">
               <summary className="cursor-pointer text-sm font-semibold text-amber-700 mb-2">
-                Business info
+                Business info (edit details)
               </summary>
               <div className="mt-3">
                 <Field label="Business name">
@@ -402,12 +814,22 @@ export default function App() {
 
             <hr className="my-4" />
 
-            <Field label="Invoice No.">
-              <input
-                className={inputCls}
-                value={data.invoiceNo}
-                onChange={(e) => update("invoiceNo", e.target.value)}
-              />
+            <Field label="Invoice No. (auto-generated)">
+              <div className="flex gap-2">
+                <input
+                  className={inputCls}
+                  value={data.invoiceNo}
+                  onChange={(e) => update("invoiceNo", e.target.value)}
+                />
+                <button
+                  type="button"
+                  onClick={handleNewInvoiceNumber}
+                  className="shrink-0 rounded-lg border border-amber-600 text-amber-700 text-xs font-semibold px-3"
+                  title="Generate next invoice number"
+                >
+                  New #
+                </button>
+              </div>
             </Field>
             <Field label="Invoice Date">
               <input
@@ -443,7 +865,7 @@ export default function App() {
 
             <hr className="my-4" />
 
-            {/* Guest title + name — stacked, full width, explicit colors */}
+            {/* Guest title + name */}
             <Field label="Title">
               <select
                 className={inputCls}
@@ -522,13 +944,37 @@ export default function App() {
 
             <hr className="my-4" />
 
-            <Field label="Room / Description">
-              <input
+            <Field label="Room Type">
+              <select
                 className={inputCls}
-                value={data.roomDescription}
-                onChange={(e) => update("roomDescription", e.target.value)}
-              />
+                value={isCustomRoom ? "custom" : data.roomDescription}
+                onChange={(e) => {
+                  if (e.target.value === "custom") {
+                    update("roomDescription", "");
+                  } else {
+                    update("roomDescription", e.target.value);
+                  }
+                }}
+              >
+                {ROOM_TYPES.map((rt) => (
+                  <option key={rt} value={rt}>
+                    {rt}
+                  </option>
+                ))}
+                <option value="custom">Custom / Other…</option>
+              </select>
             </Field>
+            {isCustomRoom && (
+              <Field label="Custom Room Description">
+                <input
+                  className={inputCls}
+                  value={data.roomDescription}
+                  onChange={(e) => update("roomDescription", e.target.value)}
+                  placeholder="Enter room description"
+                />
+              </Field>
+            )}
+
             <div className="grid grid-cols-2 gap-3">
               <Field label="Nights (if no dates above)">
                 <input
@@ -567,18 +1013,30 @@ export default function App() {
             <hr className="my-4" />
 
             <Field label="Payment Method">
-              <input
+              <select
                 className={inputCls}
                 value={data.paymentMethod}
                 onChange={(e) => update("paymentMethod", e.target.value)}
-              />
+              >
+                {PAYMENT_METHODS.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
             </Field>
             <Field label="Payment Status">
-              <input
+              <select
                 className={inputCls}
                 value={data.paymentStatus}
                 onChange={(e) => update("paymentStatus", e.target.value)}
-              />
+              >
+                {PAYMENT_STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
             </Field>
             <Field label="Transaction ID">
               <input
@@ -607,7 +1065,6 @@ export default function App() {
                 style={{ height: contentHeight * scale, position: "relative" }}
               >
                 <div
-                  ref={previewRef}
                   style={{
                     width: 700,
                     padding: 40,
@@ -620,277 +1077,7 @@ export default function App() {
                     background: "#fff",
                   }}
                 >
-                  {/* Header */}
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <div className="text-2xl font-bold tracking-wide text-gray-900">
-                        {data.businessName}
-                      </div>
-                      <div className="text-[11px] tracking-[0.25em] text-amber-700 mt-1 border-t border-amber-600 pt-1 inline-block">
-                        {data.businessTagline}
-                      </div>
-                      <div className="text-xs text-gray-600 mt-4 leading-relaxed">
-                        <div>📍 {data.address1}</div>
-                        <div className="pl-4">{data.address2}</div>
-                        <div className="mt-1">📞 {data.phone}</div>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-4xl font-bold tracking-widest text-gray-900">
-                        INVOICE
-                      </div>
-                      <div className="w-16 h-[2px] bg-amber-600 ml-auto my-2" />
-                      <table className="text-xs mt-2">
-                        <tbody>
-                          <tr>
-                            <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
-                              INVOICE NO.
-                            </td>
-                            <td className="py-0.5 text-gray-800">
-                              {data.invoiceNo}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
-                              INVOICE DATE
-                            </td>
-                            <td className="py-0.5 text-gray-800">
-                              {formatDate(data.invoiceDate)}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
-                              BOOKING SOURCE
-                            </td>
-                            <td className="py-0.5 text-gray-800">
-                              {data.bookingSource}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="font-semibold text-gray-500 pr-4 py-0.5 text-right">
-                              INVOICE STATUS
-                            </td>
-                            <td className="py-0.5 font-bold text-green-600">
-                              {data.invoiceStatus}
-                            </td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  <hr className="my-5 border-gray-200" />
-
-                  {/* Guest / Stay details */}
-                  <div className="grid grid-cols-2 gap-8">
-                    <div>
-                      <div className="font-bold text-sm text-gray-900 mb-2">
-                        GUEST DETAILS
-                      </div>
-                      <table className="text-xs w-full">
-                        <tbody>
-                          <tr>
-                            <td className="text-gray-500 py-1 w-1/2">
-                              Guest Name
-                            </td>
-                            <td className="py-1 text-gray-800">
-                              {data.guestTitle ? `${data.guestTitle} ` : ""}
-                              {data.guestName || "—"}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">Total Guests</td>
-                            <td className="py-1 text-gray-800">
-                              {data.totalGuests || "—"}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">
-                              ID / Passport No.
-                            </td>
-                            <td className="py-1 text-gray-800">
-                              {data.idPassport || "—"}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">Contact</td>
-                            <td className="py-1 text-gray-800">
-                              {data.contact || "—"}
-                            </td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                    <div>
-                      <div className="font-bold text-sm text-gray-900 mb-2">
-                        STAY DETAILS
-                      </div>
-                      <table className="text-xs w-full">
-                        <tbody>
-                          <tr>
-                            <td className="text-gray-500 py-1 w-1/2">
-                              Check-in Date
-                            </td>
-                            <td className="py-1 text-gray-800">
-                              {formatDate(data.checkIn)}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">
-                              Check-out Date
-                            </td>
-                            <td className="py-1 text-gray-800">
-                              {formatDate(data.checkOut)}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">
-                              Length of Stay
-                            </td>
-                            <td className="py-1 text-gray-800">
-                              {nights} Night{nights === 1 ? "" : "s"}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">Total Units</td>
-                            <td className="py-1 text-gray-800">
-                              {data.totalUnits || "—"}
-                            </td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  {/* Line items */}
-                  <div className="mt-6">
-                    <div className="bg-gray-100 grid grid-cols-[2fr_1fr_1fr_1fr] text-xs font-bold text-gray-700 px-3 py-2 rounded-t">
-                      <div>DESCRIPTION</div>
-                      <div className="text-center">QTY</div>
-                      <div className="text-center">RATE ({data.currency})</div>
-                      <div className="text-right">AMOUNT ({data.currency})</div>
-                    </div>
-                    <div className="grid grid-cols-[2fr_1fr_1fr_1fr] text-xs px-3 py-3 border-b border-gray-100">
-                      <div>
-                        <div className="font-semibold text-gray-800">
-                          {data.roomDescription}
-                        </div>
-                        <div className="text-gray-500 text-[11px]">
-                          {data.checkIn && data.checkOut
-                            ? `${formatDate(data.checkIn)} – ${formatDate(data.checkOut)}`
-                            : ""}
-                        </div>
-                      </div>
-                      <div className="text-center text-gray-800">
-                        {nights} Night{nights === 1 ? "" : "s"}
-                      </div>
-                      <div className="text-center text-gray-800">
-                        {fmt(rate)}
-                      </div>
-                      <div className="text-right text-gray-800">
-                        {fmt(subtotal)}
-                      </div>
-                    </div>
-                    {discount > 0 && (
-                      <div className="grid grid-cols-[2fr_1fr_1fr_1fr] text-xs px-3 py-2 border-b border-gray-100 text-gray-600">
-                        <div>{data.discountLabel || "Discount"}</div>
-                        <div className="text-center">—</div>
-                        <div className="text-center">—</div>
-                        <div className="text-right">-{fmt(discount)}</div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Total */}
-                  <div className="flex justify-between items-center mt-4">
-                    <div className="font-bold text-sm text-gray-900">
-                      TOTAL ({nights} NIGHT{nights === 1 ? "" : "S"})
-                    </div>
-                    <div className="font-bold text-xl text-gray-900">
-                      {data.currency} {fmt(total)}
-                    </div>
-                  </div>
-
-                  {/* Payment info + seal */}
-                  <div className="grid grid-cols-2 gap-8 mt-6 items-start relative">
-                    <div>
-                      <div className="font-bold text-sm text-gray-900 mb-2">
-                        PAYMENT INFORMATION
-                      </div>
-                      <table className="text-xs w-full">
-                        <tbody>
-                          <tr>
-                            <td className="text-gray-500 py-1 w-1/2">
-                              Payment Method
-                            </td>
-                            <td className="py-1 text-gray-800">
-                              {data.paymentMethod || "—"}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">
-                              Payment Status
-                            </td>
-                            <td className="py-1 font-bold text-green-600">
-                              {data.paymentStatus || "—"}
-                            </td>
-                          </tr>
-                          <tr>
-                            <td className="text-gray-500 py-1">
-                              Transaction ID
-                            </td>
-                            <td className="py-1 text-gray-800">
-                              {data.transactionId || "—"}
-                            </td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-
-                    <div className="border border-gray-200 rounded-xl p-4 relative overflow-visible">
-                      <div className="text-xs font-bold text-gray-700">
-                        TOTAL PAYABLE
-                      </div>
-                      <div className="text-2xl font-bold text-gray-900 mt-1">
-                        {data.currency} {fmt(total)}
-                      </div>
-                      {sealImage && (
-                        <img
-                          src={sealImage}
-                          alt="Company seal"
-                          style={{
-                            position: "absolute",
-                            width: 110,
-                            height: 110,
-                            objectFit: "contain",
-                            right: -20,
-                            bottom: -30,
-                            transform: "rotate(-10deg)",
-                            opacity: 0.9,
-                            mixBlendMode: "multiply",
-                            pointerEvents: "none",
-                          }}
-                        />
-                      )}
-                    </div>
-                  </div>
-
-                  <hr className="my-6 border-gray-200" />
-
-                  <div className="text-center text-xs text-gray-600">
-                    <div className="font-bold text-gray-900 mb-1">
-                      Thank you for choosing {data.businessName}.
-                    </div>
-                    <div>We appreciate your visit. Welcome back anytime!</div>
-                  </div>
-
-                  <hr className="my-4 border-gray-200" />
-
-                  <div className="flex justify-center gap-6 text-[11px] text-gray-600">
-                    <span>🌐 {data.website}</span>
-                    <span>✉️ {data.email}</span>
-                    <span>📞 {data.phone}</span>
-                  </div>
+                  <InvoiceBody />
                 </div>
               </div>
             </div>
@@ -903,6 +1090,31 @@ export default function App() {
             </button>
           </div>
         )}
+      </div>
+
+      {/* Always-present, full-size, off-screen node used ONLY for PDF/share
+          capture. Never scaled, never clipped, so html2canvas renders it
+          correctly regardless of the viewport or which tab is active. */}
+      <div
+        style={{
+          position: "fixed",
+          top: 0,
+          left: "-10000px",
+          width: 700,
+        }}
+        aria-hidden="true"
+      >
+        <div
+          ref={captureRef}
+          style={{
+            width: 700,
+            padding: 40,
+            fontFamily: "Georgia, 'Times New Roman', serif",
+            background: "#fff",
+          }}
+        >
+          <InvoiceBody />
+        </div>
       </div>
 
       {/* Sticky bottom action bar */}
