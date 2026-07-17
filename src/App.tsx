@@ -27,9 +27,9 @@ import html2canvas from "html2canvas-pro";
  * - PDF/WhatsApp export previously captured the on-screen node, which has a
  *   CSS `transform: scale()` applied for responsive display. html2canvas does
  *   not reliably render transformed nodes, which produced blank/broken PDFs.
- *   The invoice is now also rendered once, at full size, completely
- *   off-screen (no transform, no clipping) and THAT node is what gets
- *   captured. The on-screen scaled copy is purely visual.
+ *   The invoice is now also rendered once, at full size, off-screen (no
+ *   transform, no clipping) and THAT node is what gets captured. The
+ *   on-screen scaled copy is purely visual.
  *
  * MOBILE FIX NOTES (this revision):
  * - iOS Safari (and several Android browsers) automatically zoom the page
@@ -45,9 +45,31 @@ import html2canvas from "html2canvas-pro";
  *   and prevent double-tap-to-zoom on controls.
  * - Touch targets are at least 44px tall (Apple/Google's recommended
  *   minimum), and the sticky bottom action bar now respects the iPhone
- *   home-indicator safe area so it isn't obscured on notdurch devices.
+ *   home-indicator safe area so it isn't obscured on notch devices.
  * - Root container has `overflow-x-hidden` as a safety net against any
  *   accidental horizontal scroll/layout shift on small screens.
+ *
+ * INTERMITTENT "UNSTYLED / TEXT-ONLY" EXPORT FIX (this revision):
+ * - Root cause: `html2canvas` was being invoked the instant the user tapped
+ *   Download/Share, with no guarantee that (a) the seal image had finished
+ *   loading, (b) web fonts had finished loading, or (c) the browser had
+ *   actually finished a layout+paint pass on the off-screen capture node
+ *   after the most recent state change. Any one of those being incomplete
+ *   at capture time produces a flat, unstyled ("text structure only")
+ *   render — and because it's timing-dependent, it only happens sometimes.
+ * - Also, the capture node lived at `left: -10000px`, thousands of pixels
+ *   outside the viewport. Browsers can deprioritize layout/paint work for
+ *   elements that far off-screen, which made the race condition worse.
+ * - Fix: `buildPdfBlob()` now explicitly awaits `document.fonts.ready`,
+ *   waits for every `<img>` inside the capture node to finish loading (or
+ *   fail, so it never hangs forever), and waits two animation frames to
+ *   force a real layout+paint cycle — all before calling `html2canvas`.
+ *   The capture node itself now sits at `left: 0` with `opacity: 0` instead
+ *   of being pushed far off-screen, so it's treated as a normal, fully
+ *   painted element by the browser while remaining invisible to the user.
+ * - The Download/Share buttons are also disabled until the invoice has
+ *   rendered at least once (`contentHeight > 0`), so a very fast first tap
+ *   can't race the initial mount either.
  *
  * ONE MORE THING TO CHECK (outside this file): open your project's
  * index.html and confirm the viewport meta tag reads:
@@ -259,6 +281,30 @@ function Field({
 const inputCls =
   "w-full rounded-lg border border-gray-300 px-3 py-2.5 text-base bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 min-h-[44px] touch-manipulation";
 
+// ---------- Capture-readiness helpers (fixes intermittent unstyled export) ----------
+
+/** Resolves once every <img> inside `node` has either loaded or errored out. */
+function waitForImagesLoaded(node: HTMLElement): Promise<void> {
+  const imgs = Array.from(node.querySelectorAll("img"));
+  return Promise.all(
+    imgs.map((img) => {
+      if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        img.addEventListener("load", () => resolve(), { once: true });
+        // Never let a broken/slow image hang the export forever.
+        img.addEventListener("error", () => resolve(), { once: true });
+      });
+    }),
+  ).then(() => undefined);
+}
+
+/** Forces the browser to complete a real layout + paint cycle before we read from the DOM. */
+function waitTwoFrames(): Promise<void> {
+  return new Promise((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+  );
+}
+
 export default function App() {
   const [data, setData] = useState<InvoiceData>(buildDefaultData);
   const [sealImage, setSealImage] = useState<string | null>("/seal.png");
@@ -362,12 +408,24 @@ export default function App() {
     const node = captureRef.current;
     if (!node) throw new Error("Invoice content not ready");
 
+    // Make sure fonts + every image (seal included) are actually loaded,
+    // and the browser has painted the current state, BEFORE we capture it.
+    // Skipping this is what caused the intermittent unstyled/"text only"
+    // exports — html2canvas would sometimes run against a DOM that hadn't
+    // finished loading assets or settling layout yet.
+    if (document.fonts?.ready) {
+      await document.fonts.ready;
+    }
+    await waitForImagesLoaded(node);
+    await waitTwoFrames();
+
     const canvas = await html2canvas(node, {
       scale: 2,
       useCORS: true,
       backgroundColor: "#ffffff",
       logging: false,
       windowWidth: 700,
+      imageTimeout: 15000, // give a slow seal-image load enough room instead of html2canvas giving up on it
     });
 
     if (canvas.width === 0 || canvas.height === 0) {
@@ -654,6 +712,11 @@ export default function App() {
                 </tr>
               </tbody>
             </table>
+
+            {/* NEW: non-refundable policy notice */}
+            <div className="mt-3 text-[11px] italic text-red-600">
+              Note: Payments are non-refundable.
+            </div>
           </div>
 
           <div className="border border-gray-200 rounded-xl p-4 relative overflow-visible">
@@ -689,6 +752,10 @@ export default function App() {
             Thank you for choosing {data.businessName}.
           </div>
           <div>We appreciate your visit. Welcome back anytime!</div>
+          {/* NEW: repeated at the footer too, so it's visible even on a quick glance */}
+          <div className="mt-2 font-semibold text-gray-700">
+            Payments are non-refundable.
+          </div>
         </div>
 
         <hr className="my-4 border-gray-200" />
@@ -1140,15 +1207,19 @@ export default function App() {
         )}
       </div>
 
-      {/* Always-present, full-size, off-screen node used ONLY for PDF/share
-          capture. Never scaled, never clipped, so html2canvas renders it
-          correctly regardless of the viewport or which tab is active. */}
+      {/* Always-present, full-size capture node used ONLY for PDF/share
+          capture. Kept just inside the viewport (left: 0) but visually
+          hidden via opacity, so browsers don't deprioritize its layout/paint
+          the way they can for elements pushed thousands of px off-screen. */}
       <div
         style={{
           position: "fixed",
           top: 0,
-          left: "-10000px",
+          left: 0,
           width: 700,
+          opacity: 0,
+          pointerEvents: "none",
+          zIndex: -9999,
         }}
         aria-hidden="true"
       >
@@ -1174,14 +1245,14 @@ export default function App() {
         <div className="max-w-xl mx-auto flex gap-2">
           <button
             onClick={handleDownload}
-            disabled={busy !== null}
+            disabled={busy !== null || contentHeight === 0}
             className="flex-1 rounded-lg bg-gray-900 text-white text-sm font-semibold py-3 disabled:opacity-50 min-h-[44px] touch-manipulation"
           >
             {busy === "pdf" ? "Generating…" : "Download PDF"}
           </button>
           <button
             onClick={handleShareWhatsApp}
-            disabled={busy !== null}
+            disabled={busy !== null || contentHeight === 0}
             className="flex-1 rounded-lg bg-green-600 text-white text-sm font-semibold py-3 disabled:opacity-50 min-h-[44px] touch-manipulation"
           >
             {busy === "share" ? "Preparing…" : "Share WhatsApp"}
