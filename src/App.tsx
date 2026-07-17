@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { buildInvoicePdfBlob, loadImageAsDataUrl } from "./utils/PdfBuilder";
+import { buildInvoicePdfBlob, loadImageAsDataUrl } from "./utils/pdfBuilder";
 
 /**
  * SIMPLE INVOICE SYSTEM — MOBILE FIRST
