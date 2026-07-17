@@ -23,7 +23,7 @@ import html2canvas from "html2canvas-pro";
  * - Company seal: upload a PNG/JPG and it's stamped onto the invoice
  * - Download PDF or Share directly to WhatsApp (native share sheet on phones)
  *
- * FIX NOTES (this revision):
+ * FIX NOTES (earlier revision):
  * - PDF/WhatsApp export previously captured the on-screen node, which has a
  *   CSS `transform: scale()` applied for responsive display. html2canvas does
  *   not reliably render transformed nodes, which produced blank/broken PDFs.
@@ -31,51 +31,80 @@ import html2canvas from "html2canvas-pro";
  *   transform, no clipping) and THAT node is what gets captured. The
  *   on-screen scaled copy is purely visual.
  *
- * MOBILE FIX NOTES (this revision):
+ * MOBILE FIX NOTES (earlier revision):
  * - iOS Safari (and several Android browsers) automatically zoom the page
  *   in when you focus an <input>/<select>/<textarea> whose computed
- *   font-size is under 16px. This form used `text-sm` (14px) inputs, which
- *   triggered that auto-zoom, and the page never zoomed back out cleanly —
- *   hence the "becomes larger than the screen" symptom. Every field now
- *   renders at 16px minimum (`text-base`), which stops the browser from
- *   zooming in the first place.
- * - Numeric fields now set `inputMode` so mobile keyboards show the number
- *   pad instead of the full QWERTY keyboard.
+ *   font-size is under 16px. Every field renders at 16px minimum
+ *   (`text-base`), which stops the browser from zooming in the first place.
+ * - Numeric fields set `inputMode` so mobile keyboards show the number pad.
  * - Buttons/tabs use `touch-manipulation` to remove the ~300ms tap delay
  *   and prevent double-tap-to-zoom on controls.
- * - Touch targets are at least 44px tall (Apple/Google's recommended
- *   minimum), and the sticky bottom action bar now respects the iPhone
- *   home-indicator safe area so it isn't obscured on notch devices.
+ * - Touch targets are at least 44px tall, and the sticky bottom action bar
+ *   respects the iPhone home-indicator safe area.
  * - Root container has `overflow-x-hidden` as a safety net against any
  *   accidental horizontal scroll/layout shift on small screens.
  *
- * INTERMITTENT "UNSTYLED / TEXT-ONLY" EXPORT FIX (this revision):
- * - Root cause: `html2canvas` was being invoked the instant the user tapped
- *   Download/Share, with no guarantee that (a) the seal image had finished
- *   loading, (b) web fonts had finished loading, or (c) the browser had
- *   actually finished a layout+paint pass on the off-screen capture node
- *   after the most recent state change. Any one of those being incomplete
- *   at capture time produces a flat, unstyled ("text structure only")
- *   render — and because it's timing-dependent, it only happens sometimes.
- * - Also, the capture node lived at `left: -10000px`, thousands of pixels
- *   outside the viewport. Browsers can deprioritize layout/paint work for
- *   elements that far off-screen, which made the race condition worse.
- * - Fix: `buildPdfBlob()` now explicitly awaits `document.fonts.ready`,
- *   waits for every `<img>` inside the capture node to finish loading (or
- *   fail, so it never hangs forever), and waits two animation frames to
- *   force a real layout+paint cycle — all before calling `html2canvas`.
- *   The capture node itself now sits at `left: 0` with `opacity: 0` instead
- *   of being pushed far off-screen, so it's treated as a normal, fully
- *   painted element by the browser while remaining invisible to the user.
- * - The Download/Share buttons are also disabled until the invoice has
- *   rendered at least once (`contentHeight > 0`), so a very fast first tap
- *   can't race the initial mount either.
+ * INTERMITTENT "UNSTYLED / TEXT-ONLY" EXPORT FIX (earlier revision):
+ * - `buildPdfBlob()` explicitly awaits `document.fonts.ready`, waits for
+ *   every `<img>` inside the capture node to finish loading (or fail, so it
+ *   never hangs forever), and waits two animation frames to force a real
+ *   layout+paint cycle — all before calling `html2canvas`.
+ * - The capture node sits at `left: 0` with `opacity: 0` instead of being
+ *   pushed far off-screen, so browsers don't deprioritize its paint.
+ *
+ * "3RD INVOICE FAILS" FIX (this revision):
+ * - Root cause: each export allocates a full-resolution canvas (scale: 2 on
+ *   a 700px-wide node — roughly a 1400×2000+ px raster buffer) and the old
+ *   code never released that memory explicitly; it just let the variable go
+ *   out of scope and hoped garbage collection would happen "eventually."
+ *   On memory-constrained devices (mobile Safari in particular, which has a
+ *   hard per-page canvas memory ceiling), by the 2nd–3rd large canvas
+ *   allocation in the same session the browser is under enough pressure
+ *   that rasterizing complex styles (backgrounds, borders, rounded corners)
+ *   silently gets skipped, while plain text still draws fine — because text
+ *   rendering is cheap and box/background rendering is not. That is exactly
+ *   the "text structure, no design" symptom.
+ * - Fix: the instant we've read a canvas's pixel data into a PNG data URL,
+ *   we zero its width/height (`canvas.width = canvas.height = 0`), which
+ *   forces the browser to release the backing memory immediately instead of
+ *   waiting for GC. `buildPdfBlob()` also retries the capture exactly once,
+ *   after a short pause, if the first attempt comes back malformed — this
+ *   absorbs transient memory/paint hiccups without the user noticing.
+ *
+ * INVOICE NUMBERING REWORK (this revision):
+ * - Previously, `getNextInvoiceNumber()` both computed AND persisted
+ *   (wrote to localStorage) the next number the moment it was called —
+ *   which happened on mount and on every business switch. That meant the
+ *   persisted counter could advance even if the user never actually
+ *   finished an invoice (e.g. they opened preview, reconsidered, and left).
+ * - Now numbering is split into two explicit steps:
+ *     - `peekNextInvoiceNumber(code)` — READ-ONLY. Computes what the next
+ *       number would be, without writing anything. Used to populate the
+ *       draft `invoiceNo` on mount / business switch / "New #".
+ *     - `commitInvoiceNumber(code)` — WRITE. Persists the increment. Called
+ *       exactly once, only after a download or share has actually
+ *       succeeded (see `finalizeInvoice`).
+ * - Because the draft number lives in React state and is only *peeked*
+ *   (never persisted) until commit, reopening the Preview tab any number
+ *   of times shows the same number — it never drifts.
+ *
+ * NEW UX FLOW (this revision, per requirements):
+ * - Download/Share buttons are disabled until the Preview tab has actually
+ *   been opened at least once (`hasOpenedPreview`).
+ * - After a successful download or share, the invoice number is committed
+ *   (persisted increment) and a confirmation banner is shown:
+ *   "Invoice has been successfully saved/shared. Please refresh the page to
+ *   create the next invoice." Both export buttons are then disabled — by
+ *   design, a fresh invoice requires a page refresh, which guarantees a
+ *   clean draft state and rules out any stale-number or stale-canvas edge
+ *   cases entirely.
+ * - If the user cancels the native OS share sheet (browsers report this as
+ *   an AbortError), nothing is finalized and no scary error is shown — it's
+ *   treated as "changed their mind," not a failure.
  *
  * ONE MORE THING TO CHECK (outside this file): open your project's
  * index.html and confirm the viewport meta tag reads:
  *   <meta name="viewport" content="width=device-width, initial-scale=1" />
- * With the 16px input fix above you do NOT need user-scalable=no —
- * disabling pinch-zoom hurts accessibility and is no longer necessary.
  */
 
 const TITLES = ["Mr.", "Mrs.", "Ms.", "Miss", "Dr.", "Eng.", "(none)"];
@@ -174,23 +203,40 @@ interface InvoiceData {
   currency: string;
 }
 
-// ---------- Invoice number auto-increment (persisted per business) ----------
+// ---------- Invoice numbering: peek (read-only) vs commit (persist) ----------
 let memoryCounterFallback: Record<string, number> = {};
 
-function getNextInvoiceNumber(code: string): string {
+function readCounter(code: string): number {
   const storageKey = `invoiceCounter_${code}`;
-  let next = 1;
   try {
     const current = parseInt(localStorage.getItem(storageKey) || "0", 10);
-    next = (isNaN(current) ? 0 : current) + 1;
-    localStorage.setItem(storageKey, String(next));
+    return isNaN(current) ? 0 : current;
   } catch {
     // localStorage unavailable (e.g. private mode) — fall back to in-memory counter
-    memoryCounterFallback[code] = (memoryCounterFallback[code] || 0) + 1;
-    next = memoryCounterFallback[code];
+    return memoryCounterFallback[code] || 0;
   }
+}
+
+function formatInvoiceNumber(code: string, counterValue: number): string {
   const yyyy = new Date().getFullYear();
-  return `${code}-${yyyy}-${String(next).padStart(4, "0")}`;
+  return `${code}-${yyyy}-${String(counterValue).padStart(4, "0")}`;
+}
+
+/** READ-ONLY: computes what the next invoice number would be, without persisting anything. */
+function peekNextInvoiceNumber(code: string): string {
+  const current = readCounter(code);
+  return formatInvoiceNumber(code, current + 1);
+}
+
+/** WRITE: persists the increment. Call this ONLY after a download/share has actually succeeded. */
+function commitInvoiceNumber(code: string): void {
+  const storageKey = `invoiceCounter_${code}`;
+  const next = readCounter(code) + 1;
+  try {
+    localStorage.setItem(storageKey, String(next));
+  } catch {
+    memoryCounterFallback[code] = next;
+  }
 }
 
 function buildDefaultData(): InvoiceData {
@@ -281,7 +327,7 @@ function Field({
 const inputCls =
   "w-full rounded-lg border border-gray-300 px-3 py-2.5 text-base bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 min-h-[44px] touch-manipulation";
 
-// ---------- Capture-readiness helpers (fixes intermittent unstyled export) ----------
+// ---------- Capture-readiness helpers ----------
 
 /** Resolves once every <img> inside `node` has either loaded or errored out. */
 function waitForImagesLoaded(node: HTMLElement): Promise<void> {
@@ -299,10 +345,45 @@ function waitForImagesLoaded(node: HTMLElement): Promise<void> {
 }
 
 /** Forces the browser to complete a real layout + paint cycle before we read from the DOM. */
-function waitTwoFrames(): Promise<void> {
-  return new Promise((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-  );
+function waitFrames(count: number): Promise<void> {
+  return new Promise((resolve) => {
+    let remaining = count;
+    const step = () => {
+      remaining -= 1;
+      if (remaining <= 0) resolve();
+      else requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** One capture attempt. Throws if the resulting canvas is empty/malformed. */
+async function captureNodeToCanvas(
+  node: HTMLElement,
+): Promise<HTMLCanvasElement> {
+  if (document.fonts?.ready) {
+    await document.fonts.ready;
+  }
+  await waitForImagesLoaded(node);
+  await waitFrames(2);
+
+  const canvas = await html2canvas(node, {
+    scale: 2,
+    useCORS: true,
+    backgroundColor: "#ffffff",
+    logging: false,
+    windowWidth: 700,
+    imageTimeout: 15000,
+  });
+
+  if (canvas.width === 0 || canvas.height === 0) {
+    throw new Error("Captured canvas was empty");
+  }
+  return canvas;
 }
 
 export default function App() {
@@ -310,6 +391,16 @@ export default function App() {
   const [sealImage, setSealImage] = useState<string | null>("/seal.png");
   const [tab, setTab] = useState<"edit" | "preview">("edit");
   const [busy, setBusy] = useState<"pdf" | "share" | null>(null);
+
+  // Gate: export buttons stay disabled until the user has actually opened Preview.
+  const [hasOpenedPreview, setHasOpenedPreview] = useState(false);
+
+  // Set once a download/share has actually succeeded. Locks further exports
+  // until the page is refreshed, per the required confirmation flow.
+  const [finalized, setFinalized] = useState<{
+    action: "pdf" | "share";
+    message: string;
+  } | null>(null);
 
   // Full-size, unscaled, off-screen node — this is what actually gets captured for PDF/share.
   const captureRef = useRef<HTMLDivElement>(null);
@@ -323,15 +414,21 @@ export default function App() {
   const update = (key: keyof InvoiceData, value: string) =>
     setData((d) => ({ ...d, [key]: value }));
 
-  // Assign the first auto invoice number once on mount.
+  // Assign the first DRAFT invoice number once on mount. This only peeks —
+  // it does not touch the persisted counter.
   useEffect(() => {
     const code = BUSINESS_PROFILES[buildDefaultData().businessKey].code;
     setData((d) => ({
       ...d,
-      invoiceNo: d.invoiceNo || getNextInvoiceNumber(code),
+      invoiceNo: d.invoiceNo || peekNextInvoiceNumber(code),
     }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function goToPreview() {
+    setTab("preview");
+    setHasOpenedPreview(true);
+  }
 
   function handleBusinessChange(key: string) {
     const profile = BUSINESS_PROFILES[key];
@@ -346,13 +443,13 @@ export default function App() {
       phone: profile.phone,
       email: profile.email,
       website: profile.website,
-      invoiceNo: getNextInvoiceNumber(profile.code),
+      invoiceNo: peekNextInvoiceNumber(profile.code), // draft only — not persisted
     }));
   }
 
   function handleNewInvoiceNumber() {
     const code = BUSINESS_PROFILES[data.businessKey]?.code || "INV";
-    update("invoiceNo", getNextInvoiceNumber(code));
+    update("invoiceNo", peekNextInvoiceNumber(code)); // draft only — not persisted
   }
 
   // Measure the always-present, full-size capture node so the scaled
@@ -408,37 +505,32 @@ export default function App() {
     const node = captureRef.current;
     if (!node) throw new Error("Invoice content not ready");
 
-    // Make sure fonts + every image (seal included) are actually loaded,
-    // and the browser has painted the current state, BEFORE we capture it.
-    // Skipping this is what caused the intermittent unstyled/"text only"
-    // exports — html2canvas would sometimes run against a DOM that hadn't
-    // finished loading assets or settling layout yet.
-    if (document.fonts?.ready) {
-      await document.fonts.ready;
-    }
-    await waitForImagesLoaded(node);
-    await waitTwoFrames();
-
-    const canvas = await html2canvas(node, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: "#ffffff",
-      logging: false,
-      windowWidth: 700,
-      imageTimeout: 15000, // give a slow seal-image load enough room instead of html2canvas giving up on it
-    });
-
-    if (canvas.width === 0 || canvas.height === 0) {
-      throw new Error("Captured canvas was empty");
+    let canvas: HTMLCanvasElement;
+    try {
+      canvas = await captureNodeToCanvas(node);
+    } catch (firstError) {
+      // A malformed first capture is almost always a transient memory/paint
+      // hiccup (especially on the 2nd/3rd export in the same session).
+      // Pause briefly and try exactly once more before giving up.
+      await sleep(300);
+      canvas = await captureNodeToCanvas(node);
     }
 
     const imgData = canvas.toDataURL("image/png");
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
+
+    // Release the canvas's backing memory immediately instead of waiting for
+    // garbage collection. This is what prevents later exports in the same
+    // session from degrading on memory-constrained devices.
+    canvas.width = 0;
+    canvas.height = 0;
 
     const pdf = new jsPDF({ unit: "px", format: "a4" });
     const pageWidth = pdf.internal.pageSize.getWidth();
     const pageHeight = pdf.internal.pageSize.getHeight();
     const imgWidth = pageWidth;
-    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    const imgHeight = (canvasHeight * imgWidth) / canvasWidth;
 
     if (imgHeight <= pageHeight) {
       pdf.addImage(imgData, "PNG", 0, 0, imgWidth, imgHeight);
@@ -457,7 +549,21 @@ export default function App() {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    // Defer revoke slightly — revoking immediately can cancel the download
+    // in some mobile browsers before it has actually started reading the blob.
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function finalizeInvoice(action: "pdf" | "share") {
+    const code = BUSINESS_PROFILES[data.businessKey]?.code || "INV";
+    commitInvoiceNumber(code); // persist the increment — only happens here, once
+    setFinalized({
+      action,
+      message:
+        action === "pdf"
+          ? "Invoice has been successfully saved. Please refresh the page to create the next invoice."
+          : "Invoice has been successfully shared. Please refresh the page to create the next invoice.",
+    });
   }
 
   async function handleDownload() {
@@ -465,6 +571,7 @@ export default function App() {
       setBusy("pdf");
       const blob = await buildPdfBlob();
       downloadBlob(blob, `Invoice-${data.invoiceNo || "draft"}.pdf`);
+      finalizeInvoice("pdf");
     } catch (e) {
       console.error("PDF generation failed:", e);
       const msg = e instanceof Error ? e.message : String(e);
@@ -499,10 +606,17 @@ export default function App() {
         );
         window.open(`https://wa.me/?text=${text}`, "_blank");
       }
+      finalizeInvoice("share");
     } catch (e) {
-      console.error("WhatsApp share failed:", e);
-      const msg = e instanceof Error ? e.message : String(e);
-      alert(`Could not share the PDF.\n\nDetails: ${msg}`);
+      // A user cancelling the native OS share sheet reports as an
+      // AbortError — that's "changed their mind," not a failure. Don't
+      // finalize, and don't alarm them with an error dialog.
+      const isUserCancel = e instanceof DOMException && e.name === "AbortError";
+      if (!isUserCancel) {
+        console.error("WhatsApp share failed:", e);
+        const msg = e instanceof Error ? e.message : String(e);
+        alert(`Could not share the PDF.\n\nDetails: ${msg}`);
+      }
     } finally {
       setBusy(null);
     }
@@ -713,7 +827,6 @@ export default function App() {
               </tbody>
             </table>
 
-            {/* NEW: non-refundable policy notice */}
             <div className="mt-3 text-[11px] italic text-red-600">
               Note: Payments are non-refundable.
             </div>
@@ -752,7 +865,6 @@ export default function App() {
             Thank you for choosing {data.businessName}.
           </div>
           <div>We appreciate your visit. Welcome back anytime!</div>
-          {/* NEW: repeated at the footer too, so it's visible even on a quick glance */}
           <div className="mt-2 font-semibold text-gray-700">
             Payments are non-refundable.
           </div>
@@ -769,8 +881,11 @@ export default function App() {
     );
   }
 
+  const canExport =
+    hasOpenedPreview && contentHeight > 0 && busy === null && !finalized;
+
   return (
-    <div className="min-h-screen bg-gray-100 pb-24 overflow-x-hidden">
+    <div className="min-h-screen bg-gray-100 pb-32 overflow-x-hidden">
       {/* Top tab bar */}
       <div className="sticky top-0 z-20 bg-white border-b border-gray-200 px-3 pt-3 pb-0">
         <h1 className="text-base font-bold text-gray-800 mb-2 px-1">
@@ -786,7 +901,7 @@ export default function App() {
             Edit
           </button>
           <button
-            onClick={() => setTab("preview")}
+            onClick={goToPreview}
             className={`flex-1 py-2.5 text-sm font-semibold rounded-md transition touch-manipulation min-h-[44px] ${
               tab === "preview"
                 ? "bg-white shadow text-gray-900"
@@ -806,6 +921,7 @@ export default function App() {
                 className={inputCls}
                 value={data.businessKey}
                 onChange={(e) => handleBusinessChange(e.target.value)}
+                disabled={!!finalized}
               >
                 {BUSINESS_KEYS.map((k) => (
                   <option key={k} value={k}>
@@ -914,17 +1030,19 @@ export default function App() {
 
             <hr className="my-4" />
 
-            <Field label="Invoice No. (auto-generated)">
+            <Field label="Invoice No. (auto-generated draft — only confirmed on save/share)">
               <div className="flex gap-2">
                 <input
                   className={inputCls}
                   value={data.invoiceNo}
                   onChange={(e) => update("invoiceNo", e.target.value)}
+                  disabled={!!finalized}
                 />
                 <button
                   type="button"
                   onClick={handleNewInvoiceNumber}
-                  className="shrink-0 rounded-lg border border-amber-600 text-amber-700 text-xs font-semibold px-3 min-h-[44px] touch-manipulation"
+                  disabled={!!finalized}
+                  className="shrink-0 rounded-lg border border-amber-600 text-amber-700 text-xs font-semibold px-3 min-h-[44px] touch-manipulation disabled:opacity-50"
                   title="Generate next invoice number"
                 >
                   New #
@@ -1162,7 +1280,7 @@ export default function App() {
             </Field>
 
             <button
-              onClick={() => setTab("preview")}
+              onClick={goToPreview}
               className="w-full mt-2 rounded-lg bg-amber-600 text-white text-sm font-semibold py-3 hover:bg-amber-700 min-h-[44px] touch-manipulation"
             >
               Preview Invoice →
@@ -1236,6 +1354,16 @@ export default function App() {
         </div>
       </div>
 
+      {/* Confirmation banner — shown once a download/share has succeeded. */}
+      {finalized && (
+        <div
+          className="fixed inset-x-0 bg-green-600 text-white text-sm font-medium text-center px-4 py-3 z-30"
+          style={{ bottom: "calc(4.75rem + env(safe-area-inset-bottom))" }}
+        >
+          {finalized.message}
+        </div>
+      )}
+
       {/* Sticky bottom action bar — padding-bottom includes the iPhone
           home-indicator safe area so the buttons never sit under it. */}
       <div
@@ -1245,14 +1373,28 @@ export default function App() {
         <div className="max-w-xl mx-auto flex gap-2">
           <button
             onClick={handleDownload}
-            disabled={busy !== null || contentHeight === 0}
+            disabled={!canExport}
+            title={
+              !hasOpenedPreview
+                ? "Open Preview first"
+                : finalized
+                  ? "Refresh the page to create the next invoice"
+                  : undefined
+            }
             className="flex-1 rounded-lg bg-gray-900 text-white text-sm font-semibold py-3 disabled:opacity-50 min-h-[44px] touch-manipulation"
           >
             {busy === "pdf" ? "Generating…" : "Download PDF"}
           </button>
           <button
             onClick={handleShareWhatsApp}
-            disabled={busy !== null || contentHeight === 0}
+            disabled={!canExport}
+            title={
+              !hasOpenedPreview
+                ? "Open Preview first"
+                : finalized
+                  ? "Refresh the page to create the next invoice"
+                  : undefined
+            }
             className="flex-1 rounded-lg bg-green-600 text-white text-sm font-semibold py-3 disabled:opacity-50 min-h-[44px] touch-manipulation"
           >
             {busy === "share" ? "Preparing…" : "Share WhatsApp"}
