@@ -1,37 +1,39 @@
 import { useEffect, useRef, useState } from "react";
-import jsPDF from "jspdf";
-import html2canvas from "html2canvas-pro";
+import { buildInvoicePdfBlob, loadImageAsDataUrl } from "./utils/PdfBuilder";
 
 /**
  * SIMPLE INVOICE SYSTEM — MOBILE FIRST
  * -------------------------------------
- * npm install jspdf html2canvas-pro
+ * npm install jspdf
+ * (html2canvas / html2canvas-pro are NO LONGER NEEDED and can be removed
+ * from package.json — see note below.)
  *
- * IMPORTANT: uses `html2canvas-pro`, NOT the original `html2canvas`.
- * If your Tailwind version is v4+, its default color palette compiles to
- * oklch()/lab() color values, which the classic html2canvas cannot parse —
- * it throws immediately and every export silently fails into the catch
- * block. html2canvas-pro is a maintained fork that supports these modern
- * color functions and is a drop-in replacement (same API).
+ * WHY THIS VERSION IS DIFFERENT (root cause fix)
+ * -----------------------------------------------
+ * The previous approach rendered the invoice as styled HTML, took a
+ * SCREENSHOT of it with html2canvas(-pro), and embedded that screenshot
+ * image into the PDF. That pipeline is inherently flaky: html2canvas has to
+ * clone the live DOM, re-resolve every stylesheet, wait for fonts/images,
+ * and rasterize backgrounds/borders/rounded corners into a canvas — and on
+ * some fraction of exports (memory pressure, timing, paint scheduling) that
+ * rasterization step silently drops the styled boxes while plain text still
+ * draws fine. That's exactly the "sometimes it comes out as unstyled text"
+ * symptom you were seeing. It wasn't happening "every time" because it's a
+ * race condition, not a hard bug — which made it very hard to pin down.
  *
- * - Edit / Preview tabs (built for small screens, works fine on desktop too)
- * - Business selector (auto-fills business details per property)
- * - Guest title dropdown (Mr. / Mrs. / Ms. / Miss / Dr. / Eng.)
- * - Room type dropdown (with "Custom" fallback)
- * - Payment method + payment status dropdowns
- * - Invoice number auto-increments per business (persisted in localStorage)
- * - Company seal: upload a PNG/JPG and it's stamped onto the invoice
- * - Download PDF or Share directly to WhatsApp (native share sheet on phones)
+ * This version removes screenshotting entirely. `buildPdfBlob()` now calls
+ * `buildInvoicePdfBlob()` (see pdfBuilder.ts), which draws the invoice
+ * directly onto the PDF using jsPDF's own text/line/rect drawing commands.
+ * There is no DOM clone, no canvas, no "did the styles paint in time" step —
+ * so there is nothing left that can intermittently fail. The exact same
+ * invoice data always produces the exact same PDF, every single time.
  *
- * FIX NOTES (earlier revision):
- * - PDF/WhatsApp export previously captured the on-screen node, which has a
- *   CSS `transform: scale()` applied for responsive display. html2canvas does
- *   not reliably render transformed nodes, which produced blank/broken PDFs.
- *   The invoice is now also rendered once, at full size, off-screen (no
- *   transform, no clipping) and THAT node is what gets captured. The
- *   on-screen scaled copy is purely visual.
+ * The on-screen Preview tab still uses your original Tailwind/HTML markup
+ * (InvoiceBody) purely for the user to look at — that part never changes
+ * and never gets exported directly. Only the PDF you download/share is now
+ * built by pdfBuilder.ts.
  *
- * MOBILE FIX NOTES (earlier revision):
+ * MOBILE FIX NOTES (kept from earlier revisions):
  * - iOS Safari (and several Android browsers) automatically zoom the page
  *   in when you focus an <input>/<select>/<textarea> whose computed
  *   font-size is under 16px. Every field renders at 16px minimum
@@ -44,63 +46,25 @@ import html2canvas from "html2canvas-pro";
  * - Root container has `overflow-x-hidden` as a safety net against any
  *   accidental horizontal scroll/layout shift on small screens.
  *
- * INTERMITTENT "UNSTYLED / TEXT-ONLY" EXPORT FIX (earlier revision):
- * - `buildPdfBlob()` explicitly awaits `document.fonts.ready`, waits for
- *   every `<img>` inside the capture node to finish loading (or fail, so it
- *   never hangs forever), and waits two animation frames to force a real
- *   layout+paint cycle — all before calling `html2canvas`.
- * - The capture node sits at `left: 0` with `opacity: 0` instead of being
- *   pushed far off-screen, so browsers don't deprioritize its paint.
- *
- * "3RD INVOICE FAILS" FIX (this revision):
- * - Root cause: each export allocates a full-resolution canvas (scale: 2 on
- *   a 700px-wide node — roughly a 1400×2000+ px raster buffer) and the old
- *   code never released that memory explicitly; it just let the variable go
- *   out of scope and hoped garbage collection would happen "eventually."
- *   On memory-constrained devices (mobile Safari in particular, which has a
- *   hard per-page canvas memory ceiling), by the 2nd–3rd large canvas
- *   allocation in the same session the browser is under enough pressure
- *   that rasterizing complex styles (backgrounds, borders, rounded corners)
- *   silently gets skipped, while plain text still draws fine — because text
- *   rendering is cheap and box/background rendering is not. That is exactly
- *   the "text structure, no design" symptom.
- * - Fix: the instant we've read a canvas's pixel data into a PNG data URL,
- *   we zero its width/height (`canvas.width = canvas.height = 0`), which
- *   forces the browser to release the backing memory immediately instead of
- *   waiting for GC. `buildPdfBlob()` also retries the capture exactly once,
- *   after a short pause, if the first attempt comes back malformed — this
- *   absorbs transient memory/paint hiccups without the user noticing.
- *
- * INVOICE NUMBERING REWORK (this revision):
- * - Previously, `getNextInvoiceNumber()` both computed AND persisted
- *   (wrote to localStorage) the next number the moment it was called —
- *   which happened on mount and on every business switch. That meant the
- *   persisted counter could advance even if the user never actually
- *   finished an invoice (e.g. they opened preview, reconsidered, and left).
- * - Now numbering is split into two explicit steps:
- *     - `peekNextInvoiceNumber(code)` — READ-ONLY. Computes what the next
- *       number would be, without writing anything. Used to populate the
- *       draft `invoiceNo` on mount / business switch / "New #".
- *     - `commitInvoiceNumber(code)` — WRITE. Persists the increment. Called
- *       exactly once, only after a download or share has actually
- *       succeeded (see `finalizeInvoice`).
+ * INVOICE NUMBERING (kept from earlier revisions):
+ * - `peekNextInvoiceNumber(code)` — READ-ONLY. Computes what the next
+ *   number would be, without writing anything. Used to populate the draft
+ *   `invoiceNo` on mount / business switch / "New #".
+ * - `commitInvoiceNumber(code)` — WRITE. Persists the increment. Called
+ *   exactly once, only after a download or share has actually succeeded.
  * - Because the draft number lives in React state and is only *peeked*
  *   (never persisted) until commit, reopening the Preview tab any number
  *   of times shows the same number — it never drifts.
  *
- * NEW UX FLOW (this revision, per requirements):
- * - Download/Share buttons are disabled until the Preview tab has actually
- *   been opened at least once (`hasOpenedPreview`).
+ * UX FLOW (kept from earlier revisions):
+ * - Download/Share buttons are disabled until Preview has been opened at
+ *   least once.
  * - After a successful download or share, the invoice number is committed
- *   (persisted increment) and a confirmation banner is shown:
- *   "Invoice has been successfully saved/shared. Please refresh the page to
- *   create the next invoice." Both export buttons are then disabled — by
- *   design, a fresh invoice requires a page refresh, which guarantees a
- *   clean draft state and rules out any stale-number or stale-canvas edge
- *   cases entirely.
- * - If the user cancels the native OS share sheet (browsers report this as
- *   an AbortError), nothing is finalized and no scary error is shown — it's
- *   treated as "changed their mind," not a failure.
+ *   and a confirmation banner is shown. Both export buttons are then
+ *   disabled until the page is refreshed, guaranteeing a clean draft state
+ *   for the next invoice.
+ * - If the user cancels the native OS share sheet (AbortError), nothing is
+ *   finalized and no error is shown.
  *
  * ONE MORE THING TO CHECK (outside this file): open your project's
  * index.html and confirm the viewport meta tag reads:
@@ -327,65 +291,6 @@ function Field({
 const inputCls =
   "w-full rounded-lg border border-gray-300 px-3 py-2.5 text-base bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 min-h-[44px] touch-manipulation";
 
-// ---------- Capture-readiness helpers ----------
-
-/** Resolves once every <img> inside `node` has either loaded or errored out. */
-function waitForImagesLoaded(node: HTMLElement): Promise<void> {
-  const imgs = Array.from(node.querySelectorAll("img"));
-  return Promise.all(
-    imgs.map((img) => {
-      if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-      return new Promise<void>((resolve) => {
-        img.addEventListener("load", () => resolve(), { once: true });
-        // Never let a broken/slow image hang the export forever.
-        img.addEventListener("error", () => resolve(), { once: true });
-      });
-    }),
-  ).then(() => undefined);
-}
-
-/** Forces the browser to complete a real layout + paint cycle before we read from the DOM. */
-function waitFrames(count: number): Promise<void> {
-  return new Promise((resolve) => {
-    let remaining = count;
-    const step = () => {
-      remaining -= 1;
-      if (remaining <= 0) resolve();
-      else requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  });
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** One capture attempt. Throws if the resulting canvas is empty/malformed. */
-async function captureNodeToCanvas(
-  node: HTMLElement,
-): Promise<HTMLCanvasElement> {
-  if (document.fonts?.ready) {
-    await document.fonts.ready;
-  }
-  await waitForImagesLoaded(node);
-  await waitFrames(2);
-
-  const canvas = await html2canvas(node, {
-    scale: 2,
-    useCORS: true,
-    backgroundColor: "#ffffff",
-    logging: false,
-    windowWidth: 700,
-    imageTimeout: 15000,
-  });
-
-  if (canvas.width === 0 || canvas.height === 0) {
-    throw new Error("Captured canvas was empty");
-  }
-  return canvas;
-}
-
 export default function App() {
   const [data, setData] = useState<InvoiceData>(buildDefaultData);
   const [sealImage, setSealImage] = useState<string | null>("/seal.png");
@@ -402,11 +307,9 @@ export default function App() {
     message: string;
   } | null>(null);
 
-  // Full-size, unscaled, off-screen node — this is what actually gets captured for PDF/share.
-  const captureRef = useRef<HTMLDivElement>(null);
-
-  // On-screen scaled copy — purely visual, never used for export.
+  // On-screen scaled preview node — purely visual, never used for export.
   const scaleWrapRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   const [scale, setScale] = useState(1);
   const [contentHeight, setContentHeight] = useState(0);
@@ -452,22 +355,21 @@ export default function App() {
     update("invoiceNo", peekNextInvoiceNumber(code)); // draft only — not persisted
   }
 
-  // Measure the always-present, full-size capture node so the scaled
-  // preview wrapper knows how tall to be.
+  // Measure the on-screen preview node so the scaled wrapper knows how tall to be.
   useEffect(() => {
     function recalc() {
       if (scaleWrapRef.current) {
         const w = scaleWrapRef.current.offsetWidth;
         setScale(Math.min(1, w / 700));
       }
-      if (captureRef.current) {
-        setContentHeight(captureRef.current.offsetHeight);
+      if (bodyRef.current) {
+        setContentHeight(bodyRef.current.offsetHeight);
       }
     }
     recalc();
     window.addEventListener("resize", recalc);
     const ro = new ResizeObserver(recalc);
-    if (captureRef.current) ro.observe(captureRef.current);
+    if (bodyRef.current) ro.observe(bodyRef.current);
     return () => {
       window.removeEventListener("resize", recalc);
       ro.disconnect();
@@ -501,44 +403,48 @@ export default function App() {
     reader.readAsDataURL(file);
   }
 
+  // ---------- PDF generation: pure vector drawing, no DOM screenshot ----------
+  // This is the fix for the intermittent "PDF comes out unstyled" bug. There
+  // is no html2canvas step anymore, so there is nothing left that can
+  // randomly fail to rasterize backgrounds/borders. Same input -> same
+  // output, every time.
   async function buildPdfBlob(): Promise<Blob> {
-    const node = captureRef.current;
-    if (!node) throw new Error("Invoice content not ready");
-
-    let canvas: HTMLCanvasElement;
-    try {
-      canvas = await captureNodeToCanvas(node);
-    } catch (firstError) {
-      // A malformed first capture is almost always a transient memory/paint
-      // hiccup (especially on the 2nd/3rd export in the same session).
-      // Pause briefly and try exactly once more before giving up.
-      await sleep(300);
-      canvas = await captureNodeToCanvas(node);
-    }
-
-    const imgData = canvas.toDataURL("image/png");
-    const canvasWidth = canvas.width;
-    const canvasHeight = canvas.height;
-
-    // Release the canvas's backing memory immediately instead of waiting for
-    // garbage collection. This is what prevents later exports in the same
-    // session from degrading on memory-constrained devices.
-    canvas.width = 0;
-    canvas.height = 0;
-
-    const pdf = new jsPDF({ unit: "px", format: "a4" });
-    const pageWidth = pdf.internal.pageSize.getWidth();
-    const pageHeight = pdf.internal.pageSize.getHeight();
-    const imgWidth = pageWidth;
-    const imgHeight = (canvasHeight * imgWidth) / canvasWidth;
-
-    if (imgHeight <= pageHeight) {
-      pdf.addImage(imgData, "PNG", 0, 0, imgWidth, imgHeight);
-    } else {
-      const scaleF = pageHeight / imgHeight;
-      pdf.addImage(imgData, "PNG", 0, 0, imgWidth * scaleF, pageHeight);
-    }
-    return pdf.output("blob");
+    const sealDataUrl = sealImage ? await loadImageAsDataUrl(sealImage) : null;
+    return buildInvoicePdfBlob(
+      {
+        businessName: data.businessName,
+        businessTagline: data.businessTagline,
+        address1: data.address1,
+        address2: data.address2,
+        phone: data.phone,
+        email: data.email,
+        website: data.website,
+        invoiceNo: data.invoiceNo,
+        invoiceDate: formatDate(data.invoiceDate),
+        bookingSource: data.bookingSource,
+        invoiceStatus: data.invoiceStatus,
+        guestTitle: data.guestTitle,
+        guestName: data.guestName || "—",
+        totalGuests: data.totalGuests,
+        idPassport: data.idPassport,
+        contact: data.contact,
+        checkInDisplay: formatDate(data.checkIn),
+        checkOutDisplay: formatDate(data.checkOut),
+        totalUnits: data.totalUnits,
+        roomDescription: data.roomDescription,
+        nights,
+        rate,
+        subtotal,
+        discountLabel: data.discountLabel,
+        discount,
+        total,
+        paymentMethod: data.paymentMethod,
+        paymentStatus: data.paymentStatus,
+        transactionId: data.transactionId,
+        currency: data.currency,
+      },
+      sealDataUrl,
+    );
   }
 
   function downloadBlob(blob: Blob, filename: string) {
@@ -622,8 +528,7 @@ export default function App() {
     }
   }
 
-  // ---------- Shared invoice markup (used for BOTH the on-screen scaled
-  // preview and the off-screen full-size capture node) ----------
+  // ---------- On-screen preview markup only (never exported directly) ----------
   function InvoiceBody() {
     return (
       <>
@@ -881,8 +786,7 @@ export default function App() {
     );
   }
 
-  const canExport =
-    hasOpenedPreview && contentHeight > 0 && busy === null && !finalized;
+  const canExport = hasOpenedPreview && busy === null && !finalized;
 
   return (
     <div className="min-h-screen bg-gray-100 pb-32 overflow-x-hidden">
@@ -1298,6 +1202,7 @@ export default function App() {
                 style={{ height: contentHeight * scale, position: "relative" }}
               >
                 <div
+                  ref={bodyRef}
                   style={{
                     width: 700,
                     padding: 40,
@@ -1323,35 +1228,6 @@ export default function App() {
             </button>
           </div>
         )}
-      </div>
-
-      {/* Always-present, full-size capture node used ONLY for PDF/share
-          capture. Kept just inside the viewport (left: 0) but visually
-          hidden via opacity, so browsers don't deprioritize its layout/paint
-          the way they can for elements pushed thousands of px off-screen. */}
-      <div
-        style={{
-          position: "fixed",
-          top: 0,
-          left: 0,
-          width: 700,
-          opacity: 0,
-          pointerEvents: "none",
-          zIndex: -9999,
-        }}
-        aria-hidden="true"
-      >
-        <div
-          ref={captureRef}
-          style={{
-            width: 700,
-            padding: 40,
-            fontFamily: "Georgia, 'Times New Roman', serif",
-            background: "#fff",
-          }}
-        >
-          <InvoiceBody />
-        </div>
       </div>
 
       {/* Confirmation banner — shown once a download/share has succeeded. */}
